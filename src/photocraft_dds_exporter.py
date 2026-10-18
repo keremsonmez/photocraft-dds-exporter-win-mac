@@ -9,18 +9,23 @@ import sys
 import os
 import subprocess
 import threading
+import tempfile
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageTk, ImageEnhance, ImageFilter, ImageOps
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
+# Import multi-engine texture compression engine
+try:
+    import dds_engine
+except ImportError:
+    from src import dds_engine
+
 # Set CustomTkinter theme
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-TOOLS_DIR = Path(r"C:\Users\kerem\AppData\Roaming\Photocraft\nvidia_tools")
-NVCOMPRESS = TOOLS_DIR / "nvcompress.exe"
 
 FORMAT_MAP = {
     "BC7 (High Quality, Full Alpha)": "-bc7",
@@ -108,6 +113,8 @@ class PhotocraftDDSExporter(ctk.CTk):
             self.load_image(initial_file)
 
     def _apply_dark_titlebar(self):
+        if sys.platform != "win32":
+            return
         try:
             import ctypes
             hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
@@ -494,9 +501,10 @@ class PhotocraftDDSExporter(ctk.CTk):
         status_frame = ctk.CTkFrame(self, height=24, fg_color="#121212", corner_radius=0)
         status_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
 
+        engine_name, _ = dds_engine.get_engine_description()
         self.status_bar = ctk.CTkLabel(
             status_frame,
-            text="NVIDIA CUDA Hardware Acceleration Enabled (nvcompress 3.2.5)",
+            text=f"Engine: {engine_name}",
             font=ctk.CTkFont(size=11),
             text_color="#76b900"
         )
@@ -567,10 +575,10 @@ class PhotocraftDDSExporter(ctk.CTk):
 
             # Auto-set output file
             if "photocraft_active_texture" in self.input_file.name.lower():
-                desktop = os.path.join(os.path.expanduser("~"), "OneDrive", "Desktop")
-                if not os.path.exists(desktop):
-                    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-                suggested_dds = os.path.join(desktop, "texture.dds")
+                desktop = Path.home() / "Desktop"
+                if not desktop.exists():
+                    desktop = Path.home() / "OneDrive" / "Desktop"
+                suggested_dds = desktop / "texture.dds"
             else:
                 suggested_dds = self.input_file.with_suffix(".dds")
             self.out_path_var.set(str(suggested_dds))
@@ -782,83 +790,58 @@ class PhotocraftDDSExporter(ctk.CTk):
                 return
             out_path = chosen
 
-        self.export_btn.configure(state="disabled", text="Compressing with CUDA...")
-        self.status_bar.configure(text="Processing texture with NVIDIA CUDA...", text_color="#76b900")
+        self.export_btn.configure(state="disabled", text="Compressing DDS...")
+        engine_name, _ = dds_engine.get_engine_description()
+        self.status_bar.configure(text=f"Exporting with {engine_name}...", text_color="#76b900")
 
         threading.Thread(target=self._execute_export, args=(out_path,), daemon=True).start()
 
     def _execute_export(self, out_path):
         try:
-            # 1. Save processed image to temporary PNG
-            temp_in = os.path.join(os.environ.get("TEMP", ""), "nvtt_export_in.png")
             img_to_export = self.processed_image or self.original_image
-            img_to_export.save(temp_in, "PNG")
-
-            # 2. Build nvcompress command
-            fmt_flag = FORMAT_MAP.get(self.format_var.get(), "-bc7")
-            effort_flag = EFFORT_MAP.get(self.effort_var.get(), "")
-
-            cmd = [str(NVCOMPRESS), fmt_flag]
-            if effort_flag:
-                cmd.append(effort_flag)
-
-            # Normal map flag
             itype = self.image_type_var.get()
-            if "Normal Map" in itype or self.sec_normal.is_open:
-                cmd.append("-normal")
-            else:
-                cmd.append("-color")
+            is_norm = "Normal Map" in itype or self.sec_normal.is_open
 
-            # Mipmaps
-            if not self.gen_mipmaps_var.get():
-                cmd.append("-nomips")
-            else:
-                m_filter = self.mip_filter_var.get()
-                if m_filter in MIP_FILTERS:
-                    cmd.extend(["-mipfilter", m_filter])
-                try:
-                    min_sz = int(self.min_mip_var.get())
-                    if min_sz > 1:
-                        cmd.extend(["-min-mip-size", str(min_sz)])
-                except Exception:
-                    pass
+            min_sz = 1
+            try:
+                min_sz = int(self.min_mip_var.get())
+            except Exception:
+                pass
 
-            # Wrap
-            if self.wrap_var.get():
-                cmd.append("-repeat")
-            else:
-                cmd.append("-clamp")
-
-            cmd.extend([temp_in, out_path])
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            success, err = dds_engine.export_dds(
+                input_image_or_path=img_to_export,
+                out_path=out_path,
+                format_choice=self.format_var.get(),
+                effort=self.effort_var.get(),
+                is_normal_map=is_norm,
+                gen_mipmaps=self.gen_mipmaps_var.get(),
+                mip_filter=self.mip_filter_var.get(),
+                min_mip_size=min_sz,
+                wrap=self.wrap_var.get()
             )
 
-            if result.returncode == 0 and os.path.exists(out_path):
+            if success and os.path.exists(out_path):
                 out_size = os.path.getsize(out_path) / 1024.0
                 self.after(0, self._on_export_success, out_path, out_size)
             else:
-                self.after(0, self._on_export_failure, result.stderr or result.stdout)
+                self.after(0, self._on_export_failure, err or "Texture compression returned an error.")
         except Exception as e:
             self.after(0, self._on_export_failure, str(e))
 
     def _on_export_success(self, out_path, out_size):
         self.export_btn.configure(state="normal", text="Save as DDS")
+        engine_name, _ = dds_engine.get_engine_description()
         msg = f"Successfully exported: {os.path.basename(out_path)} ({out_size:.1f} KB)"
         self.status_bar.configure(text=msg, text_color="#76b900")
         messagebox.showinfo(
             "Export Complete",
-            f"Texture exported successfully!\n\nSaved to:\n{out_path}\nSize: {out_size:.1f} KB\nEngine: NVIDIA CUDA nvcompress 3.2.5"
+            f"Texture exported successfully!\n\nSaved to:\n{out_path}\nSize: {out_size:.1f} KB\nEngine: {engine_name}"
         )
 
     def _on_export_failure(self, err_msg):
         self.export_btn.configure(state="normal", text="Save as DDS")
         self.status_bar.configure(text="Export failed. See error.", text_color="#ff5555")
-        messagebox.showerror("Export Failed", f"nvcompress failed with error:\n{err_msg}")
+        messagebox.showerror("Export Failed", f"DDS export failed with error:\n{err_msg}")
 
 
 if __name__ == "__main__":
